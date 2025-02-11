@@ -9,6 +9,7 @@ import onnxruntime
 import pandas as pd
 import torch
 import torch.optim as optim
+import xarray as xr
 from environs import env
 from torch_harmonics import InverseRealSHT, RealSHT
 
@@ -115,6 +116,77 @@ class data_reader:
         self.obs_var = obs_var_norm * model_std.reshape(-1, 1, 1) ** 2
 
     def get_one_state(self, tstamp):
+        ds = xr.open_zarr(
+            "gs://gcp-public-data-arco-era5/ar/1959-2022-6h-1440x721.zarr"
+        )
+
+        selected_levels = [
+            50,
+            100,
+            150,
+            200,
+            250,
+            300,
+            400,
+            500,
+            600,
+            700,
+            850,
+            925,
+            1000,
+        ]
+
+        # Filter dataset
+        filtered_ds = ds.sel(
+            time=tstamp,
+            level=selected_levels,  # Filter by pressure levels
+        )
+
+        filtered_ds = filtered_ds.where(
+            (filtered_ds.time.dt.hour == 0) | (filtered_ds.time.dt.hour == 6), drop=True
+        )
+
+        resampled_ds = filtered_ds[
+            [
+                "10m_u_component_of_wind",
+                "10m_v_component_of_wind",
+                "2m_temperature",
+                "mean_sea_level_pressure",
+                "geopotential",
+                "specific_humidity",
+                "u_component_of_wind",
+                "v_component_of_wind",
+                "temperature",
+            ]
+        ]
+
+        single_level_mapping = [
+            "10m_u_component_of_wind",
+            "10m_v_component_of_wind",
+            "2m_temperature",
+            "mean_sea_level_pressure",
+        ]
+
+        multi_level_mapping = [
+            "geopotential",
+            "specific_humidity",
+            "u_component_of_wind",
+            "v_component_of_wind",
+            "temperature",
+        ]
+
+        res = []
+
+        for keys in single_level_mapping:
+            res.append(resampled_ds[keys].values)
+
+        for keys in multi_level_mapping:
+            for levelIdx in range(13):
+                res.append(resampled_ds[keys][levelIdx].values)
+
+        return torch.from_numpy(np.array(res)).to(self.device)
+
+    def get_one_state_from_s3(self, tstamp):
         print(tstamp)
         state = []
         single_level_vnames = ["u10", "v10", "t2m", "msl"]
@@ -180,8 +252,8 @@ class cyclic_4dvar:
         self.step_int_time = pd.Timedelta("1H")
         self.da_mode = args.da_mode
         self.da_win = args.da_win
-        self.nlon = 256
-        self.nlat = 128
+        self.nlon = 1440
+        self.nlat = 721
         self.hpad = 5
         self.vname_list = ["z", "q", "u", "v", "t"]
         self.geoheight_list = [
@@ -286,7 +358,7 @@ class cyclic_4dvar:
 
     def init_model(self, path):
         # Load ONNX model
-        onnx_model_path = f"output/model/{path}/model.onnx"
+        onnx_model_path = "/content/drive/MyDrive/model.onnx"
         model = onnxruntime.InferenceSession(
             onnx_model_path, providers=["CPUExecutionProvider"]
         )
@@ -377,18 +449,18 @@ class cyclic_4dvar:
                 ),
             ]
         )
-        z = za.cpu().unsqueeze(0).numpy()  # Convert to NumPy array for ONNX runtime
+        z = za.cpu().numpy()  # Convert to NumPy array for ONNX runtime
 
         input_name = model.get_inputs()[0].name  # Get input layer name
         output_name = model.get_outputs()[0].name  # Get output layer name
 
         for _i in range(step):
-            z = model.run([output_name], {input_name: z})[0]  # Run inference
-            z = z[:, : self.nchannel]  # Apply channel slicing as in original code
+            # z = model.run([output_name], {input_name: z})[0]  # Run inference
+            z = z[: self.nchannel]  # Apply channel slicing as in original code
 
-        return z.reshape(self.nchannel, self.nlat, self.nlon) * self.model_std.reshape(
-            -1, 1, 1
-        ) + self.model_mean.reshape(-1, 1, 1)
+        return z[:69].reshape(
+            self.nchannel, self.nlat, self.nlon
+        ) * self.model_std.reshape(-1, 1, 1) + self.model_mean.reshape(-1, 1, 1)
 
     def get_current_states(self):
         if os.path.exists(f"da_cycle_results/{self.name}/current_time.txt"):
